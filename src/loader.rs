@@ -13,8 +13,8 @@ use object::{Object, ObjectMapFile, ObjectSection, SymbolMap, SymbolMapName};
 use typed_arena::Arena;
 
 use crate::{
-    Context, FrameIter, Location, LocationRangeIter, LookupContinuation, LookupResult,
-    SplitDwarfLoad,
+    Context, FrameIter, FunctionDetails, Location, LocationRangeIter, LookupContinuation,
+    LookupResult, SplitDwarfLoad,
 };
 
 /// The type used by [`Loader`] for reading DWARF data.
@@ -122,6 +122,19 @@ impl Loader {
     /// This calls [`Context::find_frames`] with the given address.
     pub fn find_frames(&self, probe: u64) -> Result<FrameIter<'_, impl gimli::Reader + '_>> {
         self.borrow_internal(|i, arena| i.find_frames(probe, arena))
+    }
+
+    /// Return the address ranges, inlined calls and source locations of the
+    /// function which contains the given virtual memory address.
+    ///
+    /// This calls [`Context::find_function_details`] with the given address.
+    /// For Mach-O object files referenced by the debug map, the addresses in the
+    /// result are translated into the address space of the executable.
+    pub fn find_function_details(
+        &self,
+        probe: u64,
+    ) -> Result<Option<FunctionDetails<'_, impl gimli::Reader + '_>>> {
+        self.borrow_internal(|i, arena| i.find_function_details(probe, arena))
     }
 
     /// Find the symbol table entry corresponding to the given virtual memory address.
@@ -330,6 +343,41 @@ impl<'a> LoaderInternal<'a> {
             let r = self.load_dwo(load, arena)?;
             frames = continuation.resume(r);
         }
+    }
+
+    fn find_function_details(
+        &self,
+        probe: u64,
+        arena: &'a LoaderArena,
+    ) -> Result<Option<FunctionDetails<'_, LoaderReader<'a>>>> {
+        let (ctx, object_probe) = self.ctx(probe, arena);
+        let mut lookup = ctx.find_function_details(object_probe);
+        let mut details = loop {
+            let (load, continuation) = match lookup {
+                LookupResult::Output(output) => break output?,
+                LookupResult::Load { load, continuation } => (load, continuation),
+            };
+
+            let r = self.load_dwo(load, arena)?;
+            lookup = continuation.resume(r);
+        };
+
+        // Translate addresses from a Mach-O object file into the executable.
+        let delta = probe.wrapping_sub(object_probe);
+        if let Some(details) = details.as_mut().filter(|_| delta != 0) {
+            let shift = |range: &mut gimli::Range| {
+                range.begin = range.begin.wrapping_add(delta);
+                range.end = range.end.wrapping_add(delta);
+            };
+            details.ranges.iter_mut().for_each(shift);
+            for inlined in &mut details.inlined_functions {
+                inlined.ranges.iter_mut().for_each(shift);
+            }
+            for row in &mut details.lines {
+                row.address = row.address.wrapping_add(delta);
+            }
+        }
+        Ok(details)
     }
 
     fn load_dwo(

@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 use core::cmp::Ordering;
 
 use gimli::ReaderOffset;
@@ -27,6 +28,9 @@ pub(crate) struct Functions<R: gimli::Reader> {
     pub(crate) functions: Box<[LazyFunction<R>]>,
     /// List of `DW_TAG_subprogram` address ranges in the unit.
     pub(crate) addresses: Box<[FunctionAddress]>,
+    /// The address ranges of each function, indexed like `functions`.
+    /// Only computed when needed by the dump API.
+    ranges_by_function: OnceCell<Box<[Vec<gimli::Range>]>>,
 }
 
 /// A single address range for a function.
@@ -35,13 +39,13 @@ pub(crate) struct Functions<R: gimli::Reader> {
 /// is handled by having multiple `FunctionAddress` entries with the same
 /// `function` field.
 pub(crate) struct FunctionAddress {
-    range: gimli::Range,
+    pub(crate) range: gimli::Range,
     /// An index into `Functions::functions`.
     pub(crate) function: usize,
 }
 
 pub(crate) struct LazyFunction<R: gimli::Reader> {
-    dw_die_offset: gimli::UnitOffset<R::Offset>,
+    pub(crate) dw_die_offset: gimli::UnitOffset<R::Offset>,
     lazy: LazyResult<Function<R>>,
 }
 
@@ -70,16 +74,16 @@ pub(crate) struct Function<R: gimli::Reader> {
     pub(crate) dw_die_offset: gimli::UnitOffset<R::Offset>,
     pub(crate) name: Option<R>,
     /// List of all `DW_TAG_inlined_subroutine` details in this function.
-    inlined_functions: Box<[InlinedFunction<R>]>,
+    pub(crate) inlined_functions: Box<[InlinedFunction<R>]>,
     /// List of `DW_TAG_inlined_subroutine` address ranges in this function.
-    inlined_addresses: Box<[InlinedFunctionAddress]>,
+    pub(crate) inlined_addresses: Box<[InlinedFunctionAddress]>,
 }
 
 pub(crate) struct InlinedFunctionAddress {
-    range: gimli::Range,
-    call_depth: usize,
+    pub(crate) range: gimli::Range,
+    pub(crate) call_depth: usize,
     /// An index into `Function::inlined_functions`.
-    function: usize,
+    pub(crate) function: usize,
 }
 
 pub(crate) struct InlinedFunction<R: gimli::Reader> {
@@ -88,6 +92,11 @@ pub(crate) struct InlinedFunction<R: gimli::Reader> {
     pub(crate) call_file: Option<u64>,
     pub(crate) call_line: u32,
     pub(crate) call_column: u32,
+    /// The index of the enclosing inlined function in `Function::inlined_functions`,
+    /// or `None` if this inlined call is directly inside the outer function.
+    pub(crate) parent: Option<usize>,
+    /// The inline nesting depth. Calls from the outer function have depth 0.
+    pub(crate) call_depth: usize,
 }
 
 impl<R: gimli::Reader> Functions<R> {
@@ -165,6 +174,21 @@ impl<R: gimli::Reader> Functions<R> {
         Ok(Functions {
             functions: functions.into_boxed_slice(),
             addresses: addresses.into_boxed_slice(),
+            ranges_by_function: OnceCell::new(),
+        })
+    }
+
+    /// Returns the address ranges of each function, sorted by address.
+    pub(crate) fn ranges_by_function(&self) -> &[Vec<gimli::Range>] {
+        self.ranges_by_function.get_or_init(|| {
+            let mut ranges = alloc::vec![Vec::new(); self.functions.len()];
+            for address in &*self.addresses {
+                ranges[address.function].push(address.range);
+            }
+            for function_ranges in &mut ranges {
+                function_ranges.sort_unstable_by_key(|range| range.begin);
+            }
+            ranges.into_boxed_slice()
         })
     }
 
@@ -196,7 +220,7 @@ impl<R: gimli::Reader> Functions<R> {
 }
 
 impl<R: gimli::Reader> Function<R> {
-    fn parse(
+    pub(crate) fn parse(
         dw_die_offset: gimli::UnitOffset<R::Offset>,
         file: DebugFile,
         unit: gimli::UnitRef<R>,
@@ -242,7 +266,7 @@ impl<R: gimli::Reader> Function<R> {
             unit,
             ctx,
         };
-        Function::parse_children(&mut state, depth, 0)?;
+        Function::parse_children(&mut state, depth, 0, None)?;
 
         // Sort ranges in "breadth-first traversal order", i.e. first by call_depth
         // and then by range.begin. This allows finding the range containing an
@@ -280,6 +304,7 @@ impl<R: gimli::Reader> Function<R> {
         state: &mut InlinedState<R>,
         depth: isize,
         inlined_depth: usize,
+        parent: Option<usize>,
     ) -> Result<(), Error> {
         loop {
             let dw_die_offset = state.entries.next_offset();
@@ -299,6 +324,7 @@ impl<R: gimli::Reader> Function<R> {
                             abbrev,
                             next_depth,
                             inlined_depth,
+                            parent,
                         )?;
                     }
                     _ => {
@@ -370,6 +396,7 @@ impl<R: gimli::Reader> InlinedFunction<R> {
         abbrev: &gimli::Abbreviation,
         depth: isize,
         inlined_depth: usize,
+        parent: Option<usize>,
     ) -> Result<(), Error> {
         let unit = state.unit;
         let mut ranges = RangeAttributes::default();
@@ -448,6 +475,8 @@ impl<R: gimli::Reader> InlinedFunction<R> {
             call_file,
             call_line,
             call_column,
+            parent,
+            call_depth: inlined_depth,
         });
 
         ranges.for_each_range(unit, |range| {
@@ -458,7 +487,7 @@ impl<R: gimli::Reader> InlinedFunction<R> {
             });
         })?;
 
-        Function::parse_children(state, depth, inlined_depth + 1)
+        Function::parse_children(state, depth, inlined_depth + 1, Some(function_index))
     }
 }
 

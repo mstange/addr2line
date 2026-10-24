@@ -66,6 +66,9 @@ mod maybe_small {
 mod frame;
 pub use frame::{demangle, demangle_auto, Frame, FrameIter, FunctionName, Location};
 
+mod details;
+pub use details::{FunctionDetails, InlinedFunctionDetails, LineRowDetails};
+
 mod function;
 mod line;
 
@@ -265,6 +268,44 @@ impl<R: gimli::Reader> Context<R> {
             })
         } else {
             LoopingLookup::new_complete(Ok(FrameIter::new_empty()))
+        }
+    }
+
+    /// Return the address ranges, inlined calls and source locations of the
+    /// function which contains `probe`.
+    ///
+    /// Here, "the function which contains `probe`" is always a non-inline function;
+    /// if `probe` is within an inlined call, the returned [`FunctionDetails`] will
+    /// still be for the closest non-inlined function parent, and it will come with
+    /// the information about all inlined calls within it, including the one that
+    /// contains `probe`.
+    ///
+    /// Consumers that only need to look up individual addresses will want to just use
+    /// [`Context::find_frames`]; this method exists for consumers which would need
+    /// to otherwise call `find_frames` for every instruction.
+    pub fn find_function_details(
+        &self,
+        probe: u64,
+    ) -> LookupResult<
+        impl LookupContinuation<Output = Result<Option<FunctionDetails<'_, R>>, Error>, Buf = R>,
+    > {
+        let mut units_iter = self.units.find(probe);
+        if let Some(unit) = units_iter.next() {
+            LoopingLookup::new_lookup(unit.find_function_details(probe, self), move |r| {
+                ControlFlow::Break(match r {
+                    Ok(None) => match units_iter.next() {
+                        Some(next_unit) => {
+                            return ControlFlow::Continue(
+                                next_unit.find_function_details(probe, self),
+                            );
+                        }
+                        None => Ok(None),
+                    },
+                    r => r,
+                })
+            })
+        } else {
+            LoopingLookup::new_complete(Ok(None))
         }
     }
 

@@ -22,7 +22,7 @@ pub(crate) struct ResUnit<R: gimli::Reader> {
     dw_unit: gimli::Unit<R>,
     pub(crate) lang: Option<gimli::DwLang>,
     lines: LazyLines,
-    functions: LazyFunctions<R>,
+    pub(crate) functions: LazyFunctions<R>,
     dwo: LazyResult<Option<Box<DwoUnit<R>>>>,
 }
 
